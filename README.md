@@ -1,7 +1,7 @@
 # Agents For Us — Skills
 
-Copy-paste abilities for your AI agent. Each folder is one skill: a set of
-instructions your agent reads and follows, plus any scripts it needs.
+Copy-paste abilities for your AI agent. Each folder is one skill: instructions
+your agent reads and follows, plus any scripts it needs.
 
 ## Available skills
 
@@ -13,25 +13,18 @@ and fixes its own sync problems. If it can't fix something, it tells you.
 **What it protects:** every skill you've taught your agent, its memories, its
 config, and your full conversation history.
 
-**Install it** — paste this to your agent:
-
-> Install the `github-backup` skill from https://github.com/pgill/agentsforus-skills
-> Then set up hourly backups of my workspace. My Railway setup already has a
-> backup token and a `hermes-backup` repo, so use those. Run one backup, then run
-> a restore drill so I can see my conversations and skills actually come back.
-> After that, keep it hourly: fix sync failures yourself, and only message me if
-> you genuinely can't.
-
-Your agent handles the rest.
+**Install it** — paste the prompt from the course into your agent. It works
+whether you set up recently or months ago; the agent checks which case you're in
+and does the right thing.
 
 ---
 
 ## How restoring works
 
 Your backup repo carries its own recovery instructions. If your server is ever
-gone, open your `hermes-backup` repo on GitHub and read `RESTORE.md` — it's
-written for someone who is not a developer, and it's kept up to date
-automatically on every backup.
+gone, open your `hermes-backup` repo on GitHub and read `RESTORE.md` — written
+for someone who isn't a developer, and kept current automatically on every
+backup.
 
 Recovery is three commands:
 
@@ -51,9 +44,26 @@ never backed up, so a leaked repo can't leak your credentials.
 
 ---
 
+## If you deployed before this skill existed
+
+Older Railway deploys included a `backup.py` daemon that pushed on its own. It
+had a bug: it committed your database on every run, which eventually grew the
+repo past GitHub's size limit and made pushes fail **silently** — the backup
+looked fine while going stale for weeks.
+
+The skill takes over pushing; `backup.py` keeps doing the parts it does well
+(creating the repo, and the nightly "your backup is stale" alert). Your agent
+handles this changeover for you — it runs a migration script that shows a plan
+first and writes nothing until you approve.
+
+New deploys don't have `backup.py` at all, and the same instructions work
+unchanged.
+
+---
+
 ## A note on trust
 
 Don't take a backup's word for it. Ask your agent to run a restore drill — it
-will restore to a scratch folder and verify the recovered conversations match
-the originals exactly. That's the difference between believing you have a backup
-and knowing it.
+restores to a scratch folder and verifies the recovered conversations match the
+originals exactly. That's the difference between believing you have a backup and
+knowing it.

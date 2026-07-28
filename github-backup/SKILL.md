@@ -181,6 +181,130 @@ need it. The repo carries its own instructions.
 
 ---
 
+## Coexisting with a pre-existing backup automation
+
+This skill often lands on a machine that **already has** a backup mechanism — a
+platform template, a deploy script, a daemon someone else wrote. Assume an
+incumbent exists and look for it *before* your first run.
+
+**Two writers to one remote is the failure mode.** If the incumbent ran
+`git init` inside the live workspace and pushes to the same repo this skill
+targets, both sides will force-push over each other and history will be lost.
+Detect it and **refuse to run**, rather than silently competing:
+
+- Check whether the live workspace root is itself a git repo (`$HERMES_ROOT/.git`).
+- If so, read its `origin` URL. If it points at the same repo you target, hard-fail
+  with the fix spelled out (stand down the old daemon, or point one side at a
+  different repo). `templates/agent-backup.sh::check_legacy_inplace_repo` does this.
+- If the remote differs, log a warning and continue — the live `.git` is excluded
+  from the mirror anyway, so it won't be committed.
+
+**Reviewing the incumbent — fetch and read the real file.** Never advise on a
+script from its description. Pull the actual source (GitHub contents API works
+without a CLI), read it, then give **line-range-level** keep/remove guidance.
+
+Useful division when the incumbent has good bootstrap logic worth keeping:
+
+- **Keep in the incumbent:** repo creation, git identity applied on every boot
+  (container layers are ephemeral — `~/.gitconfig` is lost each redeploy),
+  token-wait loops, and any existing alerting/notification path.
+- **Remove from the incumbent:** the recurring commit/push loop, and especially
+  any `git init` over the live workspace root. One owner for pushing.
+- **Audit its `.gitignore` regardless.** An incumbent written before these lessons
+  very likely has the classic holes — `caches/` without `.cache/`, and no
+  `*.db` exclusion. Both were present in a real template.
+
+## Zero-config: adopt the environment that already exists
+
+Setup friction is the enemy. Before asking the user for anything, discover what's
+already configured:
+
+- **Accept the token under whatever name it already has.** Try a list of candidate
+  env var names in priority order (platform-specific name first, generic second),
+  and read from **both the process environment and the `.env` file** — injected
+  vars never touch the file.
+- **Accept a bare repo name and resolve the owner yourself** by asking the API who
+  the token belongs to (`GET /user` → `login`). Requiring `owner/name` when you can
+  derive `owner` is needless friction.
+- **Honor platform path conventions** (`HERMES_HOME`) before falling back to a
+  hardcoded default.
+
+The goal: the user pastes one instruction and the script resolves everything else.
+Verify by running with *only* the pre-existing variables set and nothing else.
+
+---
+
+## Migrating off the Railway template's backup.py (existing installs)
+
+Older Railway template deploys ship a `backup.py` daemon that runs `git init`
+**inside** the live workspace (`/data/.hermes`) and pushes that tree to
+`hermes-backup` hourly. That legacy path is what commits `state.db` on every run
+and eventually bloats history past GitHub's 100 MB limit.
+
+**This skill and that daemon must not both push.** Two writers to one remote
+clobber each other. `agent-backup.sh` detects the conflict and refuses to run
+rather than competing (`check_legacy_inplace_repo`).
+
+**Division of labour after migration:** the template keeps doing what it's good
+at — creating the repo, setting git identity every boot, and the nightly
+stale-backup Telegram alert. The skill takes over mirroring, exporting, and
+pushing.
+
+Run the migration script — **dry-run by default**:
+
+```
+python3 scripts/migrate-from-template-backup.py --backup-py /app/backup.py
+python3 scripts/migrate-from-template-backup.py --backup-py /app/backup.py --apply
+```
+
+It is a **safe no-op when `backup.py` doesn't exist**, so the same instruction
+works for new installs. Originals are saved as `*.pre-migration`. It is
+idempotent — re-running reports "already migrated".
+
+What it changes, and why each one matters:
+
+1. **`backup_now()` → returns False immediately.** Kills the hourly push.
+2. **`git init` on the live workspace → disabled.** This is the root of the
+   conflict.
+3. **Remote wiring in `bootstrap()` → disabled.** *Non-obvious:* with `git init`
+   gone, `HERMES_HOME` isn't a repo, so `_git_ok("remote", "add", ...)` raises
+   `not a git repository` and aborts bootstrap — taking repo creation *and* the
+   Telegram alerting down with it. Must be disabled together with the init.
+4. **Initial force-push in `bootstrap()` → disabled**, and the
+   `"initial push succeeded"` log corrected so it stops claiming a push happened.
+5. **`verify()` repointed** at the skill's marker
+   (`state/agent-backup-last-success.json`) and taught to parse its JSON. *Also
+   non-obvious:* `verify()` read a marker only `backup_now()` updated, so once
+   pushing was disabled it would false-alarm every night forever. Now the
+   template's alerting watches real skill activity. Legacy bare-epoch markers
+   still parse.
+6. **`.gitignore` repaired** — adds `.cache/`, `**/.cache/`, `*.db`, `*.db-wal`,
+   `*.db-shm`, `lsp/`, `bin/`, `cron/output/`, `models_dev_cache.json`, and model
+   blob patterns. The template's original excluded `caches/` but not `.cache/`,
+   and never excluded `state.db`.
+
+Restart the container afterwards so `backup.py` reloads.
+
+### Existing repos carry bloat
+
+An existing `hermes-backup` already contains committed `state.db` snapshots and
+possibly model blobs. Exclusions are forward-only — old commits still carry them.
+Rebuild history once:
+
+```
+./agent-backup.sh --reset-history
+```
+
+This makes the current tree a single fresh commit, force-pushes, and runs `gc`.
+Safe here because `hermes-backup` is backup-only with no collaborators. It
+discards prior backup *history*; current state is fully preserved. Warn the user
+that a force-push is about to happen and say why.
+
+Optionally reclaim the legacy repo's disk (often 1–2 GB) with
+`--remove-legacy-git` on the migration script.
+
+---
+
 ## First-time setup
 
 1. **Confirm scope with the user.** Default: agent config, skills, memory,
@@ -418,6 +542,31 @@ Report results as a short pass/fail list, not prose.
   file tool instead of `echo`.
 - **Verify the file on disk before assuming a write succeeded.** Read it back;
   what got written is not always what was sent.
+- **`gh` CLI is often absent. Use the REST API from a written script file.** Don't
+  block on a missing CLI, and don't build `curl` commands with an inline
+  `Authorization: Bearer` header — those get mangled by redaction filters mid-shell
+  (repeated `unexpected EOF while looking for matching quote`). Write a small
+  Python file that reads the token from `.env` and uses `urllib.request`, then run
+  it. Same root cause as the secret-literal pitfall above; same fix (keep the
+  literal out of the command line).
+- **Build the token env-var name from parts inside scripts** when a literal keeps
+  getting rewritten: `KEY = "GITHUB_" + "TOKEN"`. Reading `.env` line-by-line with
+  `startswith(KEY + "=")` avoids regex literals that trip the same filter.
+- **Uploading multiple files to GitHub without a local clone:** use the Git Data
+  API in sequence — create a blob per file, build one tree with `base_tree` set to
+  the current commit's tree, create a commit with the old head as parent, then
+  `PATCH` the ref. One atomic commit instead of N contents-API calls. Set mode
+  `100755` on `.sh`/`.py` so scripts stay executable, and **verify by anonymous
+  clone** (`git -c credential.helper= clone <https url>`) that the repo is really
+  public, the files landed, and the exec bits survived.
+- **`cd` into a directory you later delete breaks subsequent commands** with
+  `getcwd: cannot access parent directories`. After removing a test tree, pass an
+  explicit `workdir` or `cd` somewhere stable before the next command.
+- **`git init --bare` in a `&&` chain doesn't leave you in the new repo.** Use
+  `git init -q --bare /path` then `git -C /path ...` rather than
+  `cd dir && git init --bare x.git` followed by commands assuming the new cwd. Also
+  set `git -C bare.git symbolic-ref HEAD refs/heads/main` on a test bare repo, or
+  clones of it fail with "remote HEAD refers to nonexistent ref."
 
 ## Related files
 

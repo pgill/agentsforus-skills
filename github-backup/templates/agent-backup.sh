@@ -32,7 +32,13 @@ MIRRORS=(
 MARKER="$STATE_DIR/agent-backup-last-success.json"
 SKIPLOG="$STATE_DIR/agent-backup-skipped.log"
 DRY_RUN=0
-[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+RESET_HISTORY=0
+for arg in "$@"; do
+  case "$arg" in
+    --dry-run)       DRY_RUN=1 ;;
+    --reset-history) RESET_HISTORY=1 ;;
+  esac
+done
 
 log() { printf '[agent-backup] %s\n' "$*" >&2; }
 die() { log "FAIL: $*"; exit 1; }
@@ -423,6 +429,30 @@ check_legacy_inplace_repo() {
   esac
 }
 
+# One-time migration for repos that already carry bloat (committed state.db
+# snapshots, model blobs) from the legacy in-place backup. Rebuilds the branch as
+# a single clean commit and force-pushes. Only safe for a backup-only repo with
+# no collaborators -- which hermes-backup is by definition.
+reset_history() {
+  log "REBUILDING HISTORY: current tree becomes a single fresh commit."
+  log "Prior backup *history* will be discarded; current state is preserved."
+  local before after
+  before="$(du -sh "$REPO/.git" 2>/dev/null | cut -f1 || echo '?')"
+  git -C "$REPO" checkout -q --orphan _clean_rebuild
+  git -C "$REPO" add -A
+  git -C "$REPO" commit -q -m "agent backup (history rebuilt) $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  git -C "$REPO" branch -q -D main 2>/dev/null || true
+  git -C "$REPO" branch -q -m main
+  if ! git -C "$REPO" push -q --force origin main 2>"$STATE_DIR/agent-backup-push.err"; then
+    log "FORCE PUSH FAILED:"; cat "$STATE_DIR/agent-backup-push.err" >&2
+    die "history rebuild could not be pushed"
+  fi
+  git -C "$REPO" reflog expire --expire=now --all >/dev/null 2>&1 || true
+  git -C "$REPO" gc --prune=now --quiet >/dev/null 2>&1 || true
+  after="$(du -sh "$REPO/.git" 2>/dev/null | cut -f1 || echo '?')"
+  log "history rebuilt and force-pushed (.git ${before} -> ${after})"
+}
+
 # ------------------------------- run ----------------------------------------
 resolve_slug
 check_legacy_inplace_repo
@@ -439,6 +469,16 @@ completeness_gate
 if [ "$DRY_RUN" = 1 ]; then
   log "dry run - would commit:"; git -C "$REPO" add -A -n >/dev/null 2>&1 || true
   git -C "$REPO" status --short | head -20 >&2
+  exit 0
+fi
+
+if [ "$RESET_HISTORY" = 1 ]; then
+  reset_history
+  git -C "$REPO" fetch origin >/dev/null 2>&1
+  [ "$(git -C "$REPO" rev-parse HEAD)" = "$(git -C "$REPO" rev-parse origin/main)" ] \
+    || die "force-push reported success but HEAD != origin/main"
+  write_marker
+  log "backup pushed and verified"
   exit 0
 fi
 

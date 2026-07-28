@@ -48,7 +48,21 @@ die() { log "FAIL: $*"; exit 1; }
 # it is exported as compressed JSONL by export_sessions() below. Do not "fix"
 # this by adding *.db back in.
 EXCLUDES=(
-  '.git' '.env' '.env.*' '*.pem' '*.key' 'credentials.json' 'token.json'
+  '.git' '.env' '.env.*' '*.pem' '*.key'
+  # Credential/token files: match by CONTENT-SHAPE (any *token*, *secret*,
+  # *credential* JSON/txt), not by exact filename. The exact-name list
+  # ('credentials.json','token.json') missed every real Hermes credential
+  # file in practice: google_token.json, microsoft_token.json,
+  # whoop_token.json, google_client_secret.json, access_tokens.json,
+  # link_tokens.json, google_oauth_pending.json, google_oauth_last_url.txt
+  # all leaked into a real backup because none of them is spelled exactly
+  # "token.json" or "credentials.json". Glob broadly instead.
+  '*token*.json' '*token*.txt' '*Token*.json'
+  '*credential*.json' '*credential*.txt' '*Credential*.json'
+  '*client_secret*.json' '*client_secret*.txt'
+  '*oauth*.json' '*oauth*.txt' '*OAuth*.json'
+  '*secret*.json' '*secret*.txt' '*Secret*.json'
+  '*_token.json' '*_tokens.json'
   '*.db' '*.db-wal' '*.db-shm' '*.sqlite' '*.sqlite3'
   '.cache' 'caches' 'cache' '__pycache__' 'node_modules' '.venv' 'venv' '.bun'
   'dist' 'build' 'coverage' '.next' '.turbo'

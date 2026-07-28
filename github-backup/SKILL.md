@@ -684,6 +684,16 @@ strip the flags and jargon out of the user-facing text and put the precision in
 this skill, where the agent reads it. The user should describe the *outcome they
 want*; deciding to run a dry-run first is the agent's job, not theirs.
 
+**This is about the agent's output, not the prompt's input.** A student-facing
+prompt is allowed to carry technical setup detail — env var names
+(`GITHUB_TOKEN`), a repo URL, "check for an existing token" — because that content
+is instructions *to the agent*, not a message *from* it. The student pastes it
+without needing to understand it; only the agent reads it. Don't strip technical
+content out of a prompt just because a student will be the one pasting it. Strip
+jargon only from what the *agent says back* — its reports, its permission
+questions, its alerts. Those are the only words the student actually has to
+interpret unaided.
+
 ---
 
 ## Restore

@@ -327,3 +327,46 @@ near-bugs:
 
 An exception inside a watchdog is worse than the condition it watches for: it kills
 the only thing that would have told the user.
+
+### Don't test a replica of the loop — drive the real loop
+
+The scheduling decision ("is a check due right now?") is easy to re-implement in the
+test harness so you can table-drive it. That test is nearly worthless on its own: it
+proves *your copy* of the logic is right, not the shipped code. A typo'd constant,
+an inverted condition, or a `due` flag that's computed but never read all pass.
+
+Table-drive the decision if you like, then **additionally run the real entry point**
+with compressed timings:
+
+```python
+m.POLL_INTERVAL_S = 0.05      # seconds, not minutes
+m.VERIFY_HOUR_UTC = 99        # unreachable -> isolates the escalation path
+m._env = lambda k: {...}.get(k, "")   # creds without touching the environment
+m.subprocess.run = lambda *a, **k: None
+sent = []
+m._telegram = lambda bt, ci, text: sent.append(text)
+
+threading.Thread(target=m.main, daemon=True).start()
+time.sleep(1.0)
+assert len(sent) == expected
+```
+
+Setting the periodic trigger to an **unreachable value** is what isolates the branch
+under test — otherwise a pass may come from the normal schedule firing rather than
+the logic you meant to exercise. Run the daemon in a thread with `daemon=True` so an
+infinite `while True` can't hang the suite, and assert on the alert *text*, not just
+the count, so you catch a correct-firing alert carrying the wrong message.
+
+Age a marker file by writing it with a back-dated timestamp, and age a *bootstrap*
+marker with `os.utime(path, (t, t))` — mtime-based logic needs the filesystem
+timestamp moved, not the contents.
+
+### Re-run the whole suite after "trivial" edits, including docstrings
+
+A comment-only or docstring-only change to a delivered file still warrants the full
+suite before re-attaching. Two reasons this isn't paranoia here: the redaction
+hazard in §1 means the bytes on disk may not match the bytes sent regardless of how
+harmless the edit was, and source-scanning assertions (`"push" not in code`) read the
+docstring region — prose describing the removed push loop can flip a negative
+assertion. Slice the docstring out before scanning, and confirm the file still
+compiles after every write.

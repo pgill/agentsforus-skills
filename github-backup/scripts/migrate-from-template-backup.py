@@ -50,7 +50,18 @@ def find_backup_py(explicit=None):
 
 
 def patch_backup_py(path: pathlib.Path, apply: bool):
-    """Disable the push loop and the in-place git init. Returns list of changes."""
+    """Disable the push loop and the in-place git init. Returns list of changes.
+
+    Handles three states:
+      (a) full legacy template  -- everything present, disable it all
+      (b) pre-stripped template -- new deploys where backup_now/git init were
+          already removed upstream. Two leftovers still bite:
+            * the remote-wiring block that git init used to make valid, which
+              now raises "not a git repository" and aborts bootstrap
+            * MARKER_FILE, written once at bootstrap and never updated, so
+              verify() false-alarms forever
+      (c) already migrated      -- no-op
+    """
     src = path.read_text()
     if SENTINEL in src:
         print(f"  already migrated ({path}) -- no changes needed")
@@ -58,6 +69,11 @@ def patch_backup_py(path: pathlib.Path, apply: bool):
 
     changes = []
     out = src
+    pre_stripped = "def backup_now(" not in src
+
+    if pre_stripped:
+        print("  detected PRE-STRIPPED template (backup_now already removed "
+              "upstream) -- repairing the two leftovers")
 
     # 1) Make backup_now() a no-op. Keep the function so any caller still works.
     m = re.search(r"^def backup_now\([^)]*\)[^:]*:\n", out, re.M)
@@ -72,7 +88,7 @@ def patch_backup_py(path: pathlib.Path, apply: bool):
         )
         out = out[:m.start()] + stub + out[m.end():]
         changes.append("backup_now() neutered (returns False immediately)")
-    else:
+    elif not pre_stripped:
         print("  WARN could not find backup_now() -- inspect manually")
 
     # 2) Never git init the live workspace.
@@ -102,6 +118,20 @@ def patch_backup_py(path: pathlib.Path, apply: bool):
     if out != before:
         changes.append("initial force-push in bootstrap() disabled")
 
+    # 3a-ii) The add/commit that fed that push is now pointless and, in a non-git
+    # workspace, logs a confusing "not a git repository" line every boot.
+    before = out
+    out = re.sub(
+        r'^(\s*)_git\("add", "-A"\)\n'
+        r'\s*rc, out = _git\("commit", "-m", "chore: initial hermes workspace backup"\)\n'
+        r'\s*if rc != 0 and "nothing to commit" not in out:\n'
+        r'\s*print\(f"\[backup\] initial commit: \{out\}", flush=True\)',
+        lambda mm: (f'{mm.group(1)}{SENTINEL} -- no add/commit here; the skill\n'
+                    f'{mm.group(1)}# owns the mirror repo and its commits.'),
+        out, flags=re.M)
+    if out != before:
+        changes.append("orphaned add/commit in bootstrap() removed")
+
     # 3b) With `git init` gone, HERMES_HOME is not a repo, so the remote-wiring
     # block below it would raise "not a git repository" and abort bootstrap
     # (taking repo creation and the Telegram alert down with it). That block only
@@ -117,7 +147,12 @@ def patch_backup_py(path: pathlib.Path, apply: bool):
                     f'{mm.group(1)}# so remote wiring here would raise. The skill owns the remote.'),
         out, flags=re.M)
     if out != before:
-        changes.append("remote wiring in bootstrap() disabled (would crash without git init)")
+        changes.append("remote wiring in bootstrap() disabled "
+                       "(would raise 'not a git repository' and abort bootstrap)")
+        # remote_url is now unused; leave it (harmless) but note it
+    elif pre_stripped and 'remote_url' in out:
+        print("  WARN remote-wiring block not matched but remote_url present -- "
+              "inspect bootstrap() manually")
 
     # 3c) The unconditional set-url at the top of backup_now() has the same
     # problem, but backup_now() already returns early, so it is unreachable.
@@ -144,6 +179,18 @@ def patch_backup_py(path: pathlib.Path, apply: bool):
     if out != before:
         changes.append("verify() repointed at the skill's success marker "
                        "(prevents nightly false alarms)")
+
+    # The repointed marker lives under state/, which may not exist yet, and
+    # bootstrap()/backup_now() write to it. Make writes mkdir-safe, preserving
+    # each call site's own indentation (some sit inside try blocks).
+    before = out
+    out = re.sub(
+        r'^([ \t]+)MARKER_FILE\.write_text\(',
+        lambda mm: (f'{mm.group(1)}MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)\n'
+                    f'{mm.group(1)}MARKER_FILE.write_text('),
+        out, flags=re.M)
+    if out != before:
+        changes.append("MARKER_FILE writes made mkdir-safe")
 
     # The skill's marker is JSON, not a bare epoch. Teach verify() to read both.
     before = out

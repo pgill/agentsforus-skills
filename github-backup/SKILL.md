@@ -36,6 +36,13 @@ databases get committed, GitHub hard-rejects anything over 100 MB, pushes start
 failing, and hundreds of commits pile up locally while the user believes they're
 backed up.
 
+0. **Claim nothing you have not executed.** Every assertion about this skill —
+   "conversations are backed up", "restore works", "the migration is safe" — must
+   be backed by a real run against real data with real output. The failure mode
+   this skill exists to prevent *is* a system that reports success it never
+   verified; reproducing that behaviour in your own reporting is the worst
+   possible outcome. If you could not run it, say so plainly and name what's
+   untested.
 1. **Never run `git init` over the live workspace root.** Mirror durable files into
    a separate repo directory. Live tree → repo, one direction only.
 2. **Never commit binaries, caches, or databases.** Enforced by a size gate *and*
@@ -48,6 +55,11 @@ backed up.
 6. **A "successful" backup means the remote actually moved.** Verify
    `HEAD == origin/main` after pushing. Local commits prove nothing.
 7. **Restore defaults to dry-run.** Writing files back requires explicit `--apply`.
+8. **Prove every safety mechanism fires.** A gate, guard, or verifier that has
+   only ever been observed passing is unverified. Deliberately break the input —
+   empty workspace, oversized file, tampered row, removed remote — and confirm it
+   fails loudly with a useful message. This session found real bugs in the size
+   gate test, the completeness gate test, and the fidelity verifier by doing this.
 
 ---
 
@@ -234,54 +246,61 @@ Verify by running with *only* the pre-existing variables set and nothing else.
 
 ---
 
-## Migrating off the Railway template's backup.py (existing installs)
+## Migrating off the Railway template's backup.py
 
-Older Railway template deploys ship a `backup.py` daemon that runs `git init`
-**inside** the live workspace (`/data/.hermes`) and pushes that tree to
-`hermes-backup` hourly. That legacy path is what commits `state.db` on every run
-and eventually bloats history past GitHub's 100 MB limit.
+There are **three** possible states. The migration script detects which and does
+the right thing, so one instruction covers every student:
 
-**This skill and that daemon must not both push.** Two writers to one remote
-clobber each other. `agent-backup.sh` detects the conflict and refuses to run
-rather than competing (`check_legacy_inplace_repo`).
-
-**Division of labour after migration:** the template keeps doing what it's good
-at — creating the repo, setting git identity every boot, and the nightly
-stale-backup Telegram alert. The skill takes over mirroring, exporting, and
-pushing.
-
-Run the migration script — **dry-run by default**:
+| State | What it looks like | What's needed |
+|---|---|---|
+| **A. Full legacy** | `backup.py` with `backup_now()`, `git init`, hourly push | Disable all pushing |
+| **B. Pre-stripped** | `backup.py` with those already removed upstream | Repair 2 leftovers |
+| **C. No file** | New template without `backup.py` | Nothing (clean no-op) |
 
 ```
 python3 scripts/migrate-from-template-backup.py --backup-py /app/backup.py
 python3 scripts/migrate-from-template-backup.py --backup-py /app/backup.py --apply
 ```
 
-It is a **safe no-op when `backup.py` doesn't exist**, so the same instruction
-works for new installs. Originals are saved as `*.pre-migration`. It is
-idempotent — re-running reports "already migrated".
+Dry-run by default, idempotent, originals saved as `*.pre-migration`.
 
-What it changes, and why each one matters:
+### State B is the dangerous one — removing code isn't enough
 
-1. **`backup_now()` → returns False immediately.** Kills the hourly push.
-2. **`git init` on the live workspace → disabled.** This is the root of the
-   conflict.
-3. **Remote wiring in `bootstrap()` → disabled.** *Non-obvious:* with `git init`
-   gone, `HERMES_HOME` isn't a repo, so `_git_ok("remote", "add", ...)` raises
-   `not a git repository` and aborts bootstrap — taking repo creation *and* the
-   Telegram alerting down with it. Must be disabled together with the init.
-4. **Initial force-push in `bootstrap()` → disabled**, and the
-   `"initial push succeeded"` log corrected so it stops claiming a push happened.
-5. **`verify()` repointed** at the skill's marker
-   (`state/agent-backup-last-success.json`) and taught to parse its JSON. *Also
-   non-obvious:* `verify()` read a marker only `backup_now()` updated, so once
-   pushing was disabled it would false-alarm every night forever. Now the
-   template's alerting watches real skill activity. Legacy bare-epoch markers
-   still parse.
-6. **`.gitignore` repaired** — adds `.cache/`, `**/.cache/`, `*.db`, `*.db-wal`,
-   `*.db-shm`, `lsp/`, `bin/`, `cron/output/`, `models_dev_cache.json`, and model
-   blob patterns. The template's original excluded `caches/` but not `.cache/`,
-   and never excluded `state.db`.
+Stripping `backup_now()`, `git init`, and the push loop from the template leaves
+**two live bugs**. Both were found by executing the stripped file, not by reading
+it:
+
+1. **`bootstrap()` crashes.** `git init` is gone, so `HERMES_HOME` isn't a repo —
+   but the remote-wiring block right below it survives:
+   ```python
+   rc, _ = _git("remote", "get-url", "origin")
+   if rc != 0:
+       _git_ok("remote", "add", "origin", remote_url)   # RuntimeError here
+   ```
+   `_git_ok` raises on failure, so bootstrap dies **after** creating the GitHub
+   repo but **before** writing `BOOTSTRAP_MARKER`. It then retries forever on
+   every boot. **If you remove `git init`, you must remove the remote wiring
+   with it.**
+
+2. **`verify()` false-alarms forever.** `MARKER_FILE` is written once during
+   bootstrap and only `backup_now()` ever refreshed it. With pushing gone that
+   file freezes, so ~25h after deploy the nightly check fires a stale-backup
+   Telegram alert every night — while backups are perfectly healthy. Nothing
+   trains a user to ignore alerts faster.
+
+The script fixes both by pointing `MARKER_FILE` at the skill's marker
+(`state/agent-backup-last-success.json`) and teaching `verify()` to parse its
+JSON. The template's alerting then reflects real backup state. Legacy bare-epoch
+markers still parse, and marker writes are made `mkdir`-safe (the `state/` dir
+may not exist yet — and one write site sits inside a `try` block, so the fix must
+preserve per-site indentation).
+
+### What stays alive
+
+`_configure_git()` on every boot, GitHub repo creation, `verify()` + Telegram
+alerting. The skill takes over mirroring, exporting, and pushing. Verified by
+executing both migrated files: bootstrap returns True, repo gets created, zero
+push/init attempts, fresh marker → silence, 40h-old marker → alert.
 
 Restart the container afterwards so `backup.py` reloads.
 
@@ -295,13 +314,11 @@ Rebuild history once:
 ./agent-backup.sh --reset-history
 ```
 
-This makes the current tree a single fresh commit, force-pushes, and runs `gc`.
-Safe here because `hermes-backup` is backup-only with no collaborators. It
-discards prior backup *history*; current state is fully preserved. Warn the user
-that a force-push is about to happen and say why.
+Current tree becomes a single fresh commit, force-push, then `gc`. Safe because
+`hermes-backup` is backup-only with no collaborators. Prior backup *history* is
+discarded; current state is fully preserved. Warn the user before force-pushing.
 
-Optionally reclaim the legacy repo's disk (often 1–2 GB) with
-`--remove-legacy-git` on the migration script.
+Reclaim the legacy repo's disk (often 1–2 GB) with `--remove-legacy-git`.
 
 ---
 
@@ -572,6 +589,12 @@ Report results as a short pass/fail list, not prose.
 
 - `templates/agent-backup.sh` — mirror + JSONL session export + size gate + verified push
 - `templates/restore-agent.sh` — dry-run-by-default disaster recovery
+- `references/backup-failure-modes.md` — field incidents with real numbers, for symptom matching
+- `references/authoring-and-testing-notes.md` — local bare-repo test harness, GitHub
+  Git Data API upload recipe, credential-redaction write hazard, and how to verify a
+  patched live daemon. Read before editing the scripts.
+- `scripts/verify-backup-restore.py` — content-hash fidelity checker (run this, don't hand-verify)
+- `scripts/migrate-from-template-backup.py` — stand down the legacy Railway backup daemon
 - `references/backup-failure-modes.md` — real incidents with real numbers; read this first when diagnosing
 - `scripts/verify-backup-restore.py` — hash-based fidelity checker for restore drills
 

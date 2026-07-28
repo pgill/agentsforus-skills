@@ -163,3 +163,167 @@ This is how two real bugs surfaced that line-by-line reading had missed:
 
 Assert on the *absence* of dangerous calls (`push`, `init`) as explicitly as on
 the presence of desired ones.
+
+---
+
+## 6. Migrating a file that upstream is *also* editing
+
+The hardest case is not "patch this file." It is "patch this file, which ships in
+N different shapes because someone else is removing code from it in parallel."
+
+### Detect the variant; never assume one shape
+
+When the upstream owner strips code from the same file your migration targets, you
+face **three** states at minimum, and a migration that assumes one corrupts the
+others:
+
+| State | Marker | Action |
+|---|---|---|
+| Full original | the function is present | disable everything |
+| Pre-stripped | the function is absent | repair what the removal orphaned |
+| Already migrated | your sentinel is present | no-op |
+
+Detect with a cheap, stable probe (`"def backup_now(" not in src`), announce which
+state you found, and make every edit conditional. Write a **sentinel comment** into
+the file on first migration so idempotency is a string check, not a heuristic.
+
+Ship a genuine no-op path for "target file absent" — that's the new-install case,
+and it lets **one instruction serve every audience** instead of branching the
+user-facing docs.
+
+### Reconstruct the other variant and execute it
+
+Do not review a removal list as a diff. **Build the file exactly as specified and
+run it.** Reconstructing the upstream-stripped file from a four-line removal list
+and loading it with stubs surfaced two bugs that reading could not:
+
+- Removing `git init` orphaned the `remote add` below it → `RuntimeError`, bootstrap
+  died *after* creating the remote repo but *before* writing its completion marker,
+  so it retried forever on every boot.
+- Removing the only writer of a marker file left a nightly reader that would
+  false-alarm forever while the system was healthy.
+
+Generalise: **deleting code is an edit to everything downstream of it.** For every
+removal, ask what read the state it produced, and what ran immediately after it.
+
+### Preserve per-call-site indentation
+
+A blanket string replacement across a file assumes uniform indentation and will
+produce invalid Python the moment one call site is nested differently. Inserting a
+`mkdir` guard before `MARKER_FILE.write_text(...)` worked at module-level call
+sites and broke the one inside a `try:` block —
+`SyntaxError: expected 'except' or 'finally' block`.
+
+Capture and reuse the site's own leading whitespace:
+
+```python
+out = re.sub(r'^([ \t]+)MARKER_FILE\.write_text\(',
+             lambda m: (f'{m.group(1)}MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)\n'
+                        f'{m.group(1)}MARKER_FILE.write_text('),
+             out, flags=re.M)
+```
+
+Re-parse after **every** structural edit, and re-run the behavioural gate — this
+regression passed `ast.parse` on one variant while breaking the other.
+
+### Your test assertions are code too
+
+A gate test reported `FAIL no git init attempted` when nothing was wrong: the
+assertion substring-matched `"init"` against a joined blob of recorded calls, and
+hit the word `"initial"` in `initial commit`. **A failing assertion is not proof of
+a product bug** — confirm the assertion itself is sound before chasing the code.
+Match on structured fields (`args[0] == "init"`), not substrings of concatenated
+log text.
+
+That false positive was still useful: it pointed at a real leftover `git add`/
+`commit` pair that logged a confusing `not a git repository` line every boot. Noisy
+diagnostics in someone else's daemon are worth cleaning up as part of the
+migration, even when harmless.
+
+### Keep the incumbent's alerting pointed at live state
+
+If the incumbent has a monitoring/alerting path worth keeping, **repoint it at the
+marker your side now writes** rather than leaving it watching a file nothing
+updates. Teach it to parse both formats (new JSON *and* the legacy bare value) so
+the migration is backward-compatible, and make writes `mkdir`-safe because the new
+marker's parent directory may not exist yet.
+
+Prove all four states end-to-end: fresh marker → silence, aged marker → alert,
+legacy format → still parses, and bootstrap → completes without pushing.
+
+---
+
+## 7. Validating a clean-rewrite replacement file
+
+When you produce the *canonical* replacement (rather than patching an installed
+copy), regex surgery is the wrong tool — rewrite from the original so every
+surviving line is deliberate. But then you must prove the rewrite by execution, and
+the interesting assertions are **negative**.
+
+### Spy on `subprocess.run` to prove dangerous calls never happen
+
+Stubbing named helpers (`m._git = fake`) only catches calls routed through them. A
+rewrite may shell out directly. Intercept at the boundary instead:
+
+```python
+import subprocess
+git_calls = []
+real_run = subprocess.run
+
+def spy_run(args, **kw):
+    git_calls.append(tuple(args))
+    return real_run(args, **kw)          # let real, harmless calls through
+
+m.subprocess.run = spy_run
+m.bootstrap("faketoken", "hermes-backup")
+
+blob = " ".join(" ".join(map(str, c)) for c in git_calls)
+assert "push" not in blob
+assert "commit" not in blob
+assert "remote" not in blob
+assert not (hh / ".git").exists()        # live tree never became a repo
+```
+
+Assert on **structured fields** where a word can appear as a substring of something
+benign: `init` matches `init.defaultBranch` (a legitimate identity setting) and
+`initial`. Filter explicitly — `"init" not in blob.replace("init.defaultBranch","")`
+— or compare `args[0] == "init"`. This exact false positive cost a debugging detour
+in §6.
+
+Also assert removed functions are **gone**, not merely inert:
+`assert not hasattr(m, "backup_now")`.
+
+### Test the seam, not just the two sides
+
+Two components that each pass in isolation can still fail to meet. The handoff here
+is a marker file: the skill writes it, the companion daemon reads it. Unit tests
+stubbed both sides and proved nothing about the contract.
+
+The test that matters runs the **real** producer, then feeds its **actual output**
+to the consumer:
+
+1. Run the real backup script against the real workspace.
+2. Copy the marker it genuinely wrote into a fresh `HERMES_HOME`.
+3. Load the companion daemon and call its verifier with no marker stubbing.
+4. Assert silence.
+
+This catches path mismatches, format drift, and key-name typos that stubbed tests
+paper over — the failure mode where each side is "correct" against its own
+assumption.
+
+### Watchdog edge cases worth covering explicitly
+
+A stale-detector has more states than fresh/stale. All of these were real bugs or
+near-bugs:
+
+| Input | Required behaviour |
+|---|---|
+| Fresh new-format marker | silent |
+| Aged marker past threshold | alert, naming the repo |
+| **No marker at all** | alert — but with *setup* instructions, not "it broke" |
+| Legacy-format marker, fresh | silent (upgrading install, no false alarm) |
+| **Corrupt / truncated marker** | warn, treat as unknown, **never raise** |
+| Missing credential | clear message + wait, **not** a crash loop |
+
+An exception inside a watchdog is worse than the condition it watches for: it kills
+the only thing that would have told the user.

@@ -226,6 +226,120 @@ Useful division when the incumbent has good bootstrap logic worth keeping:
   very likely has the classic holes — `caches/` without `.cache/`, and no
   `*.db` exclusion. Both were present in a real template.
 
+### Removing code from the incumbent is an edit to everything downstream
+
+When the incumbent's owner strips its push logic (or you advise them to), **a
+removal list is not safe just because each line is individually dead.** Deleting
+code orphans whatever depended on the state it produced. Two real bugs, both from a
+four-line removal list that looked obviously correct:
+
+- Removing `git init` left the `remote add` below it raising `not a git repository`.
+  Bootstrap died *after* creating the remote repo but *before* writing its
+  completion marker → retried forever, every boot.
+- Removing the only writer of a freshness marker left a nightly reader that
+  false-alarmed forever while backups were perfectly healthy. **Nothing trains a
+  user to ignore alerts faster than an alert that is always wrong.**
+
+So, for every removal: **ask what read the state it wrote, and what ran immediately
+after it.** Then reconstruct the stripped file and *execute* it — don't review the
+diff. See `references/authoring-and-testing-notes.md` §6.
+
+Corollary for advising a human engineer: give them the removals **plus** the
+consequent removals, and say which are mandatory versus optional. A partial list
+produces a broken deploy that looks like your skill's fault.
+
+### Producing the incumbent's replacement: rewrite, don't amputate
+
+Migrating someone else's *installed* file calls for surgical patching (above). But
+when you're asked to produce **the canonical replacement** that ships going
+forward, do the opposite: **rewrite it clean from the original rather than deleting
+lines.** Deletion leaves orphans — that's the whole lesson of the previous section.
+A rewrite makes every surviving line intentional, and the resulting file is shorter
+than the diff-chain that would have produced it.
+
+Give the replacement a clear, narrow charter. The split that worked:
+
+- **Companion file keeps** what a shipped script does better than an agent:
+  create the remote repo before the agent's first run, and apply git identity on
+  **every** boot (container layers are ephemeral; `~/.gitconfig` vanishes on each
+  redeploy and its absence is the top cause of silent backup failure).
+- **Skill takes** mirroring, exporting, pushing, and self-healing — the parts that
+  need judgement.
+- **Nobody keeps** the recurring push loop or `git init` over the live workspace.
+
+Then make the file defend its own design:
+
+- **Put the rationale in the module docstring**, including the failure it prevents.
+  Someone will read this file in six months with no context and "helpfully" restore
+  the push loop unless the file argues against it in place.
+- **Read the new state marker first, fall back to the legacy one.** An upgrading
+  install has no new-format marker yet; without the fallback its first night after
+  deploy fires a false stale alert. Handle a corrupt/unparseable marker by warning
+  and treating it as unknown — never by raising inside a watchdog.
+- **Write alert copy for the actual audience.** For non-technical users, "Check
+  Railway logs for details" is a dead end. Tell them what to *say*: "Ask your
+  agent: *check my backups and fix them*." An alert that doesn't lead to a fix is
+  noise.
+- **Record resolved identifiers** (e.g. the resolved `owner/name`) in the marker
+  the companion writes, so both the skill and a human can see what this workspace
+  backs up to without re-deriving it.
+
+Verify a replacement by **executing** it: assert the *absence* of dangerous calls
+as explicitly as the presence of desired ones, and confirm a missing token produces
+a clear message and a wait rather than a crash-loop. See
+`references/authoring-and-testing-notes.md` §7 for the subprocess-spy harness,
+seam testing, and how to drive the real scheduling loop instead of re-implementing
+its logic in the test.
+
+#### Why keep a watchdog when this skill self-heals?
+
+Expect to be asked — correctly — whether an external monitor is redundant once the
+skill diagnoses and repairs its own failures. Answer honestly and narrowly:
+
+**It is redundant for backup *errors*.** The skill detects a rejected push, fixes
+the cause, and escalates when it can't. Do not build a second error-recovery path;
+that's duplicated logic that will drift.
+
+**It is not redundant for the skill *not running*.** A self-healing skill can only
+heal while it executes. The watchdog covers what the skill structurally cannot
+observe about itself:
+
+- the user never installed the skill, or never asked for a schedule
+- the scheduled job was deleted, paused, or never created
+- the agent is wedged, out of credits, or the model provider is down
+- the skill crashed before reaching its own alerting code
+
+That is the same shape as the incident this skill exists to prevent: *looks fine,
+is not fine.* Something **outside** the agent has to notice silence. Keep the
+watchdog small enough that this is obviously true — ours reads one file and is
+~40 lines. If it grows into a second backup implementation, it's wrong.
+
+Frame the tradeoff for the owner rather than deciding unilaterally: cutting it is
+legitimate, but then a user who skips the install has zero backups and nothing ever
+tells them. Say that plainly and let them choose.
+
+**Escalate the never-backed-up case faster than the stale case.** A nightly-only
+check means a user who never installed the skill hears nothing until the next
+morning — during which they have no protection at all. Once a grace period since
+bootstrap elapses with *no backup ever recorded*, alert the same day (dedupe to one
+alert per day). Keep the stale-backup check on the slow cadence; the skill owns that
+path already. Make the grace check tolerate a missing bootstrap marker without
+raising — a watchdog that crashes is worse than the condition it watches for.
+
+### Expect the incumbent to exist in several shapes at once
+
+Once an upstream owner starts editing the same file, it ships in multiple variants
+simultaneously — original, partially-stripped, and absent. **Detect the variant at
+runtime** rather than assuming, make each edit conditional, write a sentinel comment
+for idempotency, and provide a real no-op path for "file absent." That's what lets a
+single user-facing instruction serve every audience instead of branching the docs
+per cohort.
+
+Migration tooling belongs in `scripts/`, not in prose instructions. Asking an agent
+to hand-edit a user's live daemon from a description is how you break a running
+deploy; a dry-run-by-default script with `*.pre-migration` backups is repeatable and
+reviewable. `scripts/migrate-from-template-backup.py` is the worked example.
+
 ## Zero-config: adopt the environment that already exists
 
 Setup friction is the enemy. Before asking the user for anything, discover what's
@@ -474,6 +588,29 @@ Never let "the backup ran successfully" stand in for "the data comes back."
 
 ---
 
+## Delivering artifacts to the person who ships them
+
+When the owner of the incumbent asks for a replacement file, **hand them the file,
+not the file's contents.** Write it to disk and attach it (`MEDIA:/abs/path`) — do
+not paste 300 lines into chat and expect them to reassemble it. This was requested
+twice in one session; treat "give me X" for any code artifact as "give me a
+downloadable X" by default.
+
+Pair the attachment with a short summary that answers only what they need to act:
+what the file does now, what was removed, what behaviour changed, and the test
+result as a count (`21/21 checks pass`) plus the handful of cases that would worry
+them. Put the reasoning in the file's docstring, not the message.
+
+Re-run the full suite after **every** change to a delivered artifact, including a
+change you'd call cosmetic, and re-attach. A file the user already downloaded is
+stale the moment you edit it — say so explicitly when you send a replacement.
+
+State the outstanding gate every time you hand it over, in one line, at the end. If
+the artifact has never been exercised against the real external service, that fact
+does not expire because you tested it locally again.
+
+---
+
 ## Restore
 
 Full disaster recovery — Railway instance gone, fresh box, nothing but the repo.
@@ -549,14 +686,6 @@ Report results as a short pass/fail list, not prose.
   mean the cause is structural, not transient.
 - Don't include large media the user actually wants preserved — that's object
   storage, not git. Tell them so rather than silently dropping it.
-- **Authoring these scripts: secret-looking literals get mangled on write.** A
-  shell line like `grep '^GITHUB_TOKEN=' file` can be rewritten by redaction
-  filters mid-write, producing an unbalanced quote and a `syntax error near
-  unexpected token` that is invisible when reading the source. Two habits:
-  assign the key to a variable first (`key="GITHUB_TOKEN"; grep "^${key}=" file`),
-  and always run `bash -n <script>` after writing a shell file. The same applies
-  to writing test `.env` fixtures inside a shell heredoc — write those with the
-  file tool instead of `echo`.
 - **Verify the file on disk before assuming a write succeeded.** Read it back;
   what got written is not always what was sent.
 - **`gh` CLI is often absent. Use the REST API from a written script file.** Don't
@@ -587,25 +716,34 @@ Report results as a short pass/fail list, not prose.
 
 ## Related files
 
-- `templates/agent-backup.sh` — mirror + JSONL session export + size gate + verified push
-- `templates/restore-agent.sh` — dry-run-by-default disaster recovery
-- `references/backup-failure-modes.md` — field incidents with real numbers, for symptom matching
-- `references/authoring-and-testing-notes.md` — local bare-repo test harness, GitHub
-  Git Data API upload recipe, credential-redaction write hazard, and how to verify a
-  patched live daemon. Read before editing the scripts.
-- `scripts/verify-backup-restore.py` — content-hash fidelity checker (run this, don't hand-verify)
-- `scripts/migrate-from-template-backup.py` — stand down the legacy Railway backup daemon
-- `references/backup-failure-modes.md` — real incidents with real numbers; read this first when diagnosing
-- `scripts/verify-backup-restore.py` — hash-based fidelity checker for restore drills
+**Templates** (copy these into the agent's scripts dir; keep them side by side —
+`agent-backup.sh` copies `restore-agent.sh` from next to itself into the repo):
+- `templates/agent-backup.sh` — mirror + JSONL session export + size gate +
+  completeness gate + verified push. Flags: `--dry-run`, `--reset-history`.
+- `templates/restore-agent.sh` — dry-run-by-default disaster recovery,
+  self-locating when run from a cloned backup repo.
+
+**Scripts** (run these; don't hand-write equivalents):
+- `scripts/verify-backup-restore.py` — content-hash fidelity check after a restore
+  drill: `--source /data/.hermes --restored /tmp/fresh --fts`. Validated to exit 1
+  on a single tampered row, not just to pass on clean input.
+- `scripts/migrate-from-template-backup.py` — stand down a legacy in-place backup
+  daemon. Detects full-legacy / pre-stripped / already-migrated / absent, dry-run by
+  default, idempotent, keeps originals as `*.pre-migration`.
+
+**References:**
+- `references/backup-failure-modes.md` — real incidents with real numbers: the
+  2.3 GB / 446-unpushed-commit silent-stale failure, the excluded-conversations
+  near-miss, SQLite affinity corruption, and how each gate was proven to fire.
+  **Read this first when diagnosing a broken backup.**
+- `references/authoring-and-testing-notes.md` — local bare-repo test harness, the
+  credential-redaction write hazard, GitHub Git Data API multi-file upload recipe,
+  how to verify a patched live daemon, §6 on migrating a file that upstream is
+  also editing, and §7 on validating a clean-rewrite replacement (subprocess-spy
+  harness, seam testing, watchdog edge-case matrix). **Read before editing the
+  scripts.**
 
 For the *product/curriculum* side of shipping this to students (pre-ship checklist,
 cold-drill discipline, how to report confidence boundaries to the creator), see the
 `living-course-production` skill and its
 `references/student-facing-recovery-artifacts.md`.
-- `scripts/verify-backup-restore.py` — content-hash fidelity check after a restore
-  drill. Run this instead of hand-writing a comparison:
-  `verify-backup-restore.py --source /data/.hermes --restored /tmp/fresh --fts`
-- `references/backup-failure-modes.md` — real incidents with real numbers: the
-  2.3 GB / 446-unpushed-commit silent-stale failure, the excluded-conversations
-  near-miss, SQLite affinity corruption, and how each gate was proven to fire.
-  Read this first when diagnosing a broken backup.

@@ -358,6 +358,32 @@ already configured:
 The goal: the user pastes one instruction and the script resolves everything else.
 Verify by running with *only* the pre-existing variables set and nothing else.
 
+### The published copy drifts from the local copy — diff before you cite it
+
+Once a skill is distributed from a public repo, **the local working copy and the
+published copy are two different artifacts** and they desynchronize the moment you
+edit locally. Before writing any instruction that tells an agent to fetch the
+skill, diff every file against a fresh clone:
+
+```bash
+git clone -q --depth 1 <public-url> /tmp/pub
+for f in SKILL.md templates/*.sh scripts/*.py references/*.md; do
+  diff -q "$LOCAL/$f" "/tmp/pub/<skill>/$f" >/dev/null 2>&1 \
+    && echo "SAME  $f" || echo "DIFF  $f"
+done
+```
+
+This caught a published `SKILL.md` missing an entire section added minutes earlier
+— an install prompt shipped then would have delivered a stale skill while the
+message described the current one. Publish, then re-clone **anonymously** and
+confirm: the new content is present (`grep -c` for a distinctive heading), scripts
+still compile, `bash -n` passes, and exec bits survived the clone. A clone that
+carries non-executable `*.sh` files fails at the student's first run.
+
+Anonymous clone also has no credentials — so it can read but **cannot push**.
+Expect the credentialed-push step to be separate from the verification clone.
+
+
 ---
 
 ## Migrating off the Railway template's backup.py
@@ -611,6 +637,55 @@ does not expire because you tested it locally again.
 
 ---
 
+## Reporting to a non-technical user
+
+Assume the person who installed this **does not know** what a dry-run, a content
+hash, `HEAD == origin/main`, or a force-push is. They asked for peace of mind, not
+a git report. If your output requires them to learn git to interpret, you have
+failed the actual requirement even when every check passed.
+
+**Translate every verification into a consequence they can evaluate.** The check
+stays exactly as rigorous — only the words change. Never weaken a verification to
+make it easier to describe.
+
+| Don't say | Say |
+|---|---|
+| "Dry-run first, then apply" | "I'll show you exactly what I'm about to change and wait for your OK before touching anything" |
+| "Verified `HEAD == origin/main`" | "I checked GitHub's copy afterwards — your files are really there, not just saved on this server" |
+| "Verified by content hash, not row counts" | "I compared the restored conversations word-for-word against the originals — not just counted them" |
+| "Force-push to reset history" | "Your backup has old junk making it huge; I'll clear that out. Your current files stay safe" |
+| "Excluded `*.db`; exported to JSONL" | "Your conversation history is backed up as text — smaller, and readable even without the app" |
+| "112 sessions / 4,265 messages exported" | Keep the numbers — concrete counts are reassuring. Add what they mean: "that's your full history" |
+
+**Rules that follow from this:**
+
+1. **Never ask for a decision they can't make.** "Shall I proceed with the
+   dry-run?" is not a real question to them. Either do the safe thing and report
+   it, or ask a question phrased in outcomes: *"This will clear out old backup
+   junk to fix the size problem. Your current files are safe either way. OK?"*
+2. **Ask permission only where something is genuinely at risk**, and state the
+   risk in their terms. Extra confirmation prompts on safe steps teach them to
+   click through everything, including the one that matters.
+3. **Report the restore drill as an answer, not a procedure.** They want to hear
+   *"I tested it: if this server died right now, you'd get all 4,265 of your
+   messages and all 47 of your skills back."* The commands you ran are not the
+   deliverable.
+4. **Say what they must do themselves, once, plainly.** API keys aren't backed up
+   — tell them they'd re-paste those, and that it's deliberate so a leaked repo
+   can't leak their credentials.
+5. **Give one sentence they can act on when something breaks.** Not "check the
+   logs" — tell them the exact words to send you: *"check my backups and fix
+   them."*
+6. **Lead with the verdict.** Working / not working / needs a decision — first
+   line. Detail underneath, for the ones who want it.
+
+The same applies to any prompt or instruction written **for** these users to paste:
+strip the flags and jargon out of the user-facing text and put the precision in
+this skill, where the agent reads it. The user should describe the *outcome they
+want*; deciding to run a dry-run first is the agent's job, not theirs.
+
+---
+
 ## Restore
 
 Full disaster recovery — Railway instance gone, fresh box, nothing but the repo.
@@ -705,6 +780,34 @@ Report results as a short pass/fail list, not prose.
   `100755` on `.sh`/`.py` so scripts stay executable, and **verify by anonymous
   clone** (`git -c credential.helper= clone <https url>`) that the repo is really
   public, the files landed, and the exec bits survived.
+- **Never pipe a command whose exit code you are about to check.** `$?` after a
+  pipeline is the **last** command's status, not the one you care about. This
+  reported a successful push that had actually failed:
+  ```bash
+  git push -q origin HEAD:main 2>&1 | tail -3; echo "PUSH_EXIT=$?"   # WRONG: tail's status
+  ```
+  It printed `PUSH_EXIT=0` directly above `fatal: could not read Username`. That
+  is **this skill's own failure mode reproduced in its verification step** — a
+  push that failed while the check said fine. Capture output without a pipe (or
+  use `PIPESTATUS[0]` / `set -o pipefail`), then assert the remote actually moved
+  by comparing `rev-parse HEAD` to `rev-parse FETCH_HEAD`. The lesson generalizes:
+  *any* wrapper around a push — pipe, subshell, `|| true`, a `&&` chain — can
+  swallow the failure. Rule 6 is not satisfied by a zero exit code; it is
+  satisfied by a SHA comparison.
+- **Running verification tooling inside the repo can dirty the repo.** A
+  `python3 -m py_compile` on a staged file created `__pycache__/*.pyc` that
+  `git add -A` then staged — cache junk committed by the repo that exists to teach
+  not committing cache junk. Always `git status --short` after running any
+  compile/lint/test step inside a working copy, and keep a `.gitignore` with
+  `__pycache__/` and `*.pyc` in any repo you run Python checks in.
+- **Scan the staged diff for secrets before pushing to a *public* repo.** Do it in
+  a written Python file with patterns assembled from parts, not an inline `grep -E`
+  — inline credential regexes get mangled by redaction filters (same root cause as
+  the pitfalls above) and a mangled scanner silently matches nothing, which reads
+  as "clean." Check for token shapes, `KEY=<value>` assignments, bot-token
+  `digits:base62` shapes, and `BEGIN ... PRIVATE KEY`, and print an explicit
+  `CLEAN`/`FOUND` verdict plus the byte count scanned so an empty scan is
+  distinguishable from a passing one.
 - **`cd` into a directory you later delete breaks subsequent commands** with
   `getcwd: cannot access parent directories`. After removing a test tree, pass an
   explicit `workdir` or `cd` somewhere stable before the next command.
@@ -730,6 +833,13 @@ Report results as a short pass/fail list, not prose.
 - `scripts/migrate-from-template-backup.py` — stand down a legacy in-place backup
   daemon. Detects full-legacy / pre-stripped / already-migrated / absent, dry-run by
   default, idempotent, keeps originals as `*.pre-migration`.
+- `scripts/publish-and-verify.py` — publish this skill to its public distribution
+  repo and **prove it landed**: anonymous clone (confirms public), per-file drift
+  report, secret scan over the staged diff, syntax checks, cache-artifact refusal,
+  pipe-free push, SHA comparison against the remote, and a post-push anonymous
+  re-clone checking exec bits. Run this instead of hand-typing git commands —
+  every step in it exists because the hand-typed version failed. Supports
+  `--dry-run`.
 
 **References:**
 - `references/backup-failure-modes.md` — real incidents with real numbers: the
@@ -740,8 +850,8 @@ Report results as a short pass/fail list, not prose.
   credential-redaction write hazard, GitHub Git Data API multi-file upload recipe,
   how to verify a patched live daemon, §6 on migrating a file that upstream is
   also editing, and §7 on validating a clean-rewrite replacement (subprocess-spy
-  harness, seam testing, watchdog edge-case matrix). **Read before editing the
-  scripts.**
+  harness, seam testing, watchdog edge-case matrix, driving the real scheduling
+  loop instead of a replica). **Read before editing the scripts.**
 
 For the *product/curriculum* side of shipping this to students (pre-ship checklist,
 cold-drill discipline, how to report confidence boundaries to the creator), see the

@@ -1,0 +1,439 @@
+---
+name: github-backup
+description: "Back up an agent's workspace to a private GitHub repo on a schedule, self-heal common sync failures, and alert the user when it can't."
+version: 1.0.0
+author: Agents For Us
+license: MIT
+platforms: [linux]
+metadata:
+  hermes:
+    tags: [devops, backup, github, git, self-healing, disaster-recovery]
+---
+
+# GitHub Backup (agent-owned, self-healing)
+
+Use this skill when the user asks you to back up your workspace to GitHub, set up
+hourly backups, check whether backups are healthy, fix a broken backup, or restore
+from one.
+
+**You own this backup.** There is no external backup script maintained by anyone
+else. If it breaks, your job is to diagnose it, fix it if it's safely fixable, and
+tell the user plainly if it isn't.
+
+> **Scope note.** This skill is the owner for *agent-owned, self-healing, scheduled
+> GitHub backup* — the model where the agent is responsible for its own backup
+> health. A separate `workspace-mirroring` skill in the default profile covers
+> operator-run Hermes workspace mirroring. If you're setting up a backup that the
+> agent must monitor and repair on its own, use this one.
+
+---
+
+## Non-negotiable rules
+
+These exist because the naive approach (`git init` in the home directory, commit
+everything hourly) reliably destroys itself within weeks: model caches and SQLite
+databases get committed, GitHub hard-rejects anything over 100 MB, pushes start
+failing, and hundreds of commits pile up locally while the user believes they're
+backed up.
+
+1. **Never run `git init` over the live workspace root.** Mirror durable files into
+   a separate repo directory. Live tree → repo, one direction only.
+2. **Never commit binaries, caches, or databases.** Enforced by a size gate *and*
+   an exclusion list, not just `.gitignore`. Belt and suspenders.
+3. **Hard size gate before every commit.** Any file over 40 MB is excluded and
+   logged. Nothing over 90 MB may ever enter history.
+4. **Never commit secrets.** `.env`, tokens, credential JSON, key files.
+5. **Never let a push failure be silent.** A failed push is an incident. Attempt
+   the documented repairs; if they don't work, alert the user.
+6. **A "successful" backup means the remote actually moved.** Verify
+   `HEAD == origin/main` after pushing. Local commits prove nothing.
+7. **Restore defaults to dry-run.** Writing files back requires explicit `--apply`.
+
+---
+
+## What is and isn't in the backup
+
+This is the part users actually care about: *if the box disappears, what comes back?*
+
+**Recovered fully (the "training" the user put in):**
+- Agent config (`config.yaml`) and all profile configs
+- **Skills** — every custom skill, the accumulated procedural memory
+- **Memories** — the persistent memory files
+- **Conversation history** — every session and message, exported from SQLite to
+  gzipped JSONL under `conversations/`. Includes message content, roles,
+  timestamps, tool calls, and reasoning traces.
+- Cron job definitions, plans, plugins, hooks, scripts
+
+**Deliberately excluded (and why it's safe):**
+- `*.db` SQLite files — excluded from the *file* mirror because they're huge
+  binary blobs that re-diff entirely on every write (this is exactly what
+  bloated the old script's history). Conversation data is **not lost**: it's
+  exported as JSONL instead. A 148 MB `state.db` becomes ~7 MB of gzipped JSONL.
+- Full-text search index (`messages_fts*`) — derived data, rebuilds itself from
+  restored messages on first use.
+- Secrets: `.env`, tokens, OAuth credential files. **The user must re-supply
+  these on restore.** Say so explicitly; don't let them discover it mid-outage.
+- Model/package caches, logs, cron job *output*, `models_dev_cache.json`,
+  `.venv`, `node_modules` — all regenerable.
+
+Never "fix" the `*.db` exclusion by adding databases back into the file mirror.
+That reintroduces the original failure. The JSONL export is the mechanism.
+
+### Conversation export/restore fidelity
+
+The export captures each table's **original `CREATE TABLE` statement** and the
+restore replays it. This is not optional polish — restoring rows into
+hand-written DDL lets SQLite **column affinity silently corrupt data**. A
+`timestamp` column declared `text` will coerce float timestamps like
+`1780960253.0324667` into the truncated string `'1780960253.03247'`. Counts still
+match, so it looks fine. Always verify round-trip fidelity by hashing row
+content, not by comparing row counts.
+
+---
+
+## Prove it works before claiming it works
+
+An untested backup is a rumor. When you build, change, or audit a backup, the
+deliverable is a **verified restore**, not a successful backup run.
+
+1. Back up the **real workspace**, not a toy fixture. Toy fixtures don't have the
+   45 MB of transient cron output or the 148 MB database that break things.
+2. Restore into a **clean empty directory**, as if the box were gone.
+3. Verify by **content hash**, not row counts —
+   `scripts/verify-backup-restore.py --source <live> --restored <fresh>`.
+4. **Prove each gate fires** by deliberately feeding it bad input. A gate that has
+   never failed is indistinguishable from no gate. See
+   `references/backup-failure-modes.md` §5.
+5. Report real measured numbers (sessions, messages, sizes, timings). If you
+   couldn't run it, say so plainly — never describe a drill you didn't perform.
+
+**Two verification traps, both hit in practice:**
+- *Matching counts prove nothing.* 1654/1654 rows matched while every row was
+  silently corrupted by column affinity.
+- *A negative test that doesn't fail may not have applied its input.* Confirm the
+  bad input actually took effect (env var name spelled right, path actually empty)
+  before concluding the gate is broken — or worse, that it passed.
+
+State the caveats on scope: local bare repos are not real GitHub, and one machine's
+layout is not every machine's. Recommend a real-environment run before shipping to
+users.
+
+---
+
+## Reasoning about what to exclude
+
+Exclusions are where silent data loss hides. The instinct that prevents bloat is
+the same instinct that deletes the user's history.
+
+- **For every size-based exclusion, ask: what irreplaceable data lives in this file
+  type?** If any does, provide an alternate export path (as `*.db` → JSONL does).
+  Never exclude a type without answering this.
+- **Don't guess at exclusions — measure.** Run
+  `du -sh <dir>/* | sort -rh | head` and descend into the largest entries until the
+  total is explained. Agent workspaces hide transient bulk in innocuously-named
+  directories (`cron/output`, `gbrain-session-ingest`, `*_dev_cache.json`).
+- **Derived data should be excluded and rebuilt, not backed up.** Full-text search
+  indexes, caches, and compiled output all regenerate. Say so in the restore
+  output so absence doesn't read as loss.
+- **Prefer text over binary for anything version-controlled.** Text diffs
+  incrementally; binaries re-commit in full every run. That difference is the gap
+  between a 52 MB repo and a 2.3 GB one.
+
+---
+
+## Restore: never hand-write the target schema
+
+When rebuilding a structured store (SQLite, or any typed destination), **carry the
+source schema with the export and replay it.** Hand-written DDL that merely looks
+right will silently coerce types — see `references/backup-failure-modes.md` §3 for
+the affinity bug that corrupted 100% of rows while every count matched.
+
+Keep hand-written DDL only as a fallback for exports that predate schema capture,
+and prefer the captured schema whenever it's present.
+
+---
+
+## One skill, and the recovery kit ships inside the backup
+
+Backup and restore are **one skill**, not two. They share the exclusion list, the
+export format, and the schema-fidelity contract — splitting them guarantees they
+drift, and a restore that disagrees with its backup is worse than none.
+
+But the skill itself is **not** the recovery path. The skill lives in the
+workspace on the box that just died. So every backup run plants a
+**self-contained recovery kit at the repo root**:
+
+- `RESTORE.md` — plain-English recovery instructions with live counts ("772
+  conversations, 22,324 messages backed up"), rendered on the GitHub repo page
+- `restore-agent.sh` — the runnable restore script
+- `agent-backup.sh` — a copy of the script that produced the backup
+
+`restore-agent.sh` is **self-locating**: dropped at the root of a cloned backup
+repo, it detects the repo it's sitting in and needs zero arguments. Recovery is
+`git clone` → `cd` → `./restore-agent.sh`. No skill, no agent, no prior knowledge.
+
+The completeness gate treats a missing `restore-agent.sh` or `RESTORE.md` as a
+failed backup. A backup nobody can restore is not a backup.
+
+Corollary: **do not** hand users a separate "restore skill." It would be one more
+thing to install, and the one thing they'd be missing at the exact moment they
+need it. The repo carries its own instructions.
+
+---
+
+## First-time setup
+
+1. **Confirm scope with the user.** Default: agent config, skills, memory,
+   notes/brain, and any small text-based work directories. Ask before including
+   anything else.
+2. **Create a private GitHub repo** (e.g. `my-agent-backup`). Private, not public —
+   confirm this explicitly.
+3. **Get a token.** A fine-grained PAT with Contents: read/write on that one repo.
+   Store it in the agent's env file (e.g. `GITHUB_TOKEN`), never in the repo,
+   never in the script.
+4. **Set git identity** in the environment the schedule will run under:
+   `git config --global user.name` / `user.email`. Missing identity is the single
+   most common cause of "backup silently did nothing."
+5. **Install the script.** Copy `templates/agent-backup.sh` into the agent's
+   scripts directory, fill in the config block at the top, `chmod +x`.
+6. **Run it once by hand.** Confirm: commit created, push landed,
+   `HEAD == origin/main`, and the repo tree contains no `.db`, no caches, no
+   `.env`. Confirm `RESTORE.md` and `restore-agent.sh` are at the repo root.
+   Check the repo size on GitHub — it should be small (tens of MB).
+6b. **Run a restore drill.** Clone the repo to a scratch dir, run
+   `./restore-agent.sh` (dry-run), then `--apply` to a throwaway target, and
+   verify by content hash. Do this *before* the user needs it.
+7. **Schedule it hourly** using the agent's own scheduler (cron tool). Have the
+   job report only on failure or on state change, so the user isn't pinged 24
+   times a day.
+8. **Tell the user what's covered and what isn't**, in one short message.
+
+---
+
+## Hourly run behaviour
+
+Each run:
+
+1. Mirror the in-scope live paths into the repo directory, applying exclusions.
+2. Run the size gate. Log anything skipped.
+3. `git add -A`. If nothing changed, record success and exit quietly.
+4. Commit, push, then verify `HEAD == origin/main`.
+5. Write a success marker with timestamp, HEAD sha, and remote URL.
+6. On any failure: enter the self-healing path below.
+
+Stay quiet on success. Speak up on failure.
+
+---
+
+## Self-healing decision tree
+
+Diagnose before acting. Run `git -C "$REPO" status --short --branch`,
+`git log origin/main..HEAD --oneline | wc -l`, and check `du -sh "$REPO/.git"`.
+
+**Symptom: push rejected, "file exceeds GitHub's file size limit" / "large files detected"**
+- A blob is baked into history. Going forward-only exclusions won't help — old
+  commits still carry it.
+- Fix: add the offending pattern to exclusions and `.gitignore`, then rebuild
+  history as a single clean commit (see "History reset" below).
+- Safe to do autonomously **only if** the repo is backup-only with no
+  collaborators and no other machine pushes to it. Confirm that, then proceed and
+  report what you did.
+
+**Symptom: unpushed commit count is large (dozens+) or `.git` is over ~500 MB**
+- Pushes have been failing for a while. Treat as the case above: something oversized
+  is in history. Find it before resetting:
+  `git rev-list --objects --all | git cat-file --batch-check='%(objecttype) %(objectname) %(objectsize) %(rest)' | awk '$1=="blob" && $3>40000000' | sort -k3 -n -r | head`
+- Report the actual culprit files to the user, don't just silently wipe history.
+
+**Symptom: `! [rejected] ... non-fast-forward` / "fetch first"**
+- The remote has commits the local repo doesn't. For a backup-only mirror this
+  usually means the repo was reset or edited elsewhere.
+- Fix: `git fetch origin && git pull --rebase --autostash origin main`, then push.
+- If the rebase conflicts, prefer the live workspace as truth: reset onto
+  `origin/main`, re-mirror, commit fresh.
+
+**Symptom: auth failure (403/401, "could not read Username")**
+- Token missing, expired, or the remote URL lost its credentials.
+- Fix: re-read the token from the env file and `git remote set-url` with it. If the
+  token is genuinely expired or lacks scope, **you cannot fix this** — alert the
+  user with exactly what to regenerate.
+
+**Symptom: `unable to auto-detect email address (got 'root@...')`**
+- Git identity missing in the environment this run used. Scheduled runs and manual
+  shells often have different `HOME`s.
+- Fix: set identity for the environment the schedule uses, then re-run.
+
+**Symptom: repo has drifted — tracked `.db`, cache dirs, or a secret file**
+- Fix: extend exclusions + `.gitignore`, remove from the index, commit. If a
+  **secret** was committed, tell the user immediately, rotate advice first, then
+  offer history rewrite — never quietly.
+
+**Symptom: nothing changed for many consecutive runs but the workspace is active**
+- The mirror scope is probably wrong (pointing at the wrong path). Verify the
+  source paths exist and contain the expected recent files.
+
+**Anything not on this list, or any fix that would touch history containing
+non-backup data:** stop and alert the user.
+
+---
+
+## History reset (the safe nuke)
+
+Only for a private, backup-only repo with no collaborators, after confirming with
+the user (or autonomously if the user has pre-authorized self-healing):
+
+1. Fix `.gitignore` and the script's exclusion list *first*, so the problem can't
+   recur.
+2. Re-mirror the live tree into the repo dir.
+3. Create a fresh orphan branch, commit the current clean tree once, move it to
+   `main`, force-push.
+4. Verify: push landed, `HEAD == origin/main`, `.git` is small again, no oversized
+   blobs, no secrets tracked.
+5. Report: what was oversized, what's now excluded, that nothing in the live
+   workspace was touched, and that prior backup *history* is gone (current state
+   is preserved).
+
+Never force-push a repo that holds anything other than this generated mirror.
+
+---
+
+## Alerting the user
+
+When you can't fix it, send one short message with:
+- what broke, in plain language ("GitHub is rejecting the backup because a 138 MB
+  model file got picked up")
+- what it means for them ("nothing was lost locally, but the GitHub copy has been
+  stale since June 3")
+- the one thing you need from them ("regenerate the token with Contents write access")
+- what you've already tried
+
+No stack traces unless asked. No blame. No burying the ask at the bottom.
+
+### When asked "am I actually covered?", audit — don't reassure
+
+A question like *"can they really get their agents back?"* or *"is conversation
+history included?"* is a request for **evidence**, not comfort. Treat it as a
+directive to go verify, and answer with measured numbers from a real drill.
+
+- **Enumerate the live workspace before answering.** Don't answer from the
+  exclusion list you wrote — inspect what actually exists on disk and where the
+  irreplaceable data lives. This is how the excluded-conversations gap was caught.
+- **Lead with the gap if you find one.** If your own design had a hole, say so in
+  the first sentence and name what would have been lost. Users trust a backup they
+  watched you stress-test far more than one you assured them about.
+- **Distinguish what's recovered, what's excluded-but-safe (regenerable), and what
+  the user must re-supply** (API keys, OAuth re-auth). Surface the re-supply list
+  *before* an outage, in the restore plan output — never let them discover it
+  mid-recovery.
+- **Report bugs you found in your own work**, including ones you already fixed. The
+  affinity bug is more reassuring told than hidden, because it demonstrates the
+  verification is real.
+
+Never let "the backup ran successfully" stand in for "the data comes back."
+
+---
+
+## Restore
+
+Full disaster recovery — Railway instance gone, fresh box, nothing but the repo.
+
+1. Clone the backup repo to a scratch directory.
+2. Run `restore-agent.sh` from the repo root — **dry-run by default.** It prints
+   a plan: file counts per directory, session/message counts per profile, and an
+   explicit list of what is *not* in the backup. It self-locates, so no args are
+   needed when run from inside the clone.
+3. Apply with `--apply` after the user reviews the plan.
+4. Existing `state.db` files are moved aside to `*.pre-restore` rather than
+   clobbered.
+5. Re-supply secrets (API keys, tokens, OAuth re-authorization), then start the
+   agent. FTS search rebuilds on first use.
+
+**Verify a restore actually worked** — don't trust "RESTORE COMPLETE":
+- Compare session/message counts against the source or the backup INDEX.json.
+- Hash message row content (`session_id, role, content, timestamp`) on both sides
+  and confirm the digests match. Counts alone hide affinity corruption.
+- Confirm skills and memories directories have the expected file counts.
+- Spot-read one long user message and confirm it's intact, not truncated.
+
+Run a restore drill *before* the user needs one. An untested backup is a rumor.
+
+---
+
+## Verification checklist
+
+Run this after setup, after any fix, and any time the user asks "is my backup working?"
+
+- [ ] `HEAD == origin/main`
+- [ ] Success marker exists and is fresh relative to the schedule
+- [ ] `git status --short` is clean
+- [ ] No tracked `.db`, `.db-wal`, `.db-shm`, `.env`, cache dirs, or `node_modules`
+- [ ] No blob in history over 40 MB
+- [ ] `.git` directory is small (tens of MB, not hundreds)
+- [ ] Repo is still **private**
+- [ ] Hourly schedule exists and is enabled
+- [ ] Most recent commit timestamp is within the expected cadence
+- [ ] `conversations/INDEX.json` exists and its message count looks right
+- [ ] `RESTORE.md` + `restore-agent.sh` present at the repo root
+- [ ] A restore drill has been run at least once and verified by content hash
+
+Report results as a short pass/fail list, not prose.
+
+---
+
+## Pitfalls
+
+- **Writing a shell script that contains a secret KEY NAME literal can get the
+  line mangled in transit.** Lines like `grep -m1 '^GITHUB_TOKEN=' "$ENV_FILE"`
+  passed through a redaction filter came out truncated, producing an unbalanced
+  quote and `syntax error near unexpected token` — in a *shipped* script, only
+  discovered by running it. Same thing happened writing `.env` fixtures with
+  heredocs in `terminal`. **Fix:** use variable indirection so the literal never
+  appears inline:
+  `local key="GITHUB_TOKEN"; grep -m1 "^${key}=" "$ENV_FILE"`.
+  Then always `bash -n script.sh` after writing any shell file that touches
+  credentials, before trusting it. Never assume a write landed verbatim.
+- **Patching a function header by anchoring on the line above it can eat the
+  header.** Two `patch` calls that inserted a new function before `mirror_tree() {`
+  consumed the `mirror_tree() {` line itself, leaving an orphaned body. Both times
+  `bash -n` caught it. Anchor patches on a unique interior line, and re-run a
+  syntax check after every structural edit.
+- `.gitignore` pattern gotcha: `caches/` does **not** match `.cache/`. Exclude
+  both, plus `**/.cache/`, `*.db*`, `models/`, `*.bin`, `*.safetensors`, `*.pt`,
+  `*.gguf`, `*.onnx`.
+- `.gitignore` doesn't untrack already-tracked files. Use `git rm --cached`.
+- A local commit is not a backup. Only a verified remote update counts.
+- Don't hand-edit files inside the repo working copy — the next mirror run
+  overwrites them. Edit the live workspace.
+- Don't retry a push in a loop without diagnosing. Repeated identical failures
+  mean the cause is structural, not transient.
+- Don't include large media the user actually wants preserved — that's object
+  storage, not git. Tell them so rather than silently dropping it.
+- **Authoring these scripts: secret-looking literals get mangled on write.** A
+  shell line like `grep '^GITHUB_TOKEN=' file` can be rewritten by redaction
+  filters mid-write, producing an unbalanced quote and a `syntax error near
+  unexpected token` that is invisible when reading the source. Two habits:
+  assign the key to a variable first (`key="GITHUB_TOKEN"; grep "^${key}=" file`),
+  and always run `bash -n <script>` after writing a shell file. The same applies
+  to writing test `.env` fixtures inside a shell heredoc — write those with the
+  file tool instead of `echo`.
+- **Verify the file on disk before assuming a write succeeded.** Read it back;
+  what got written is not always what was sent.
+
+## Related files
+
+- `templates/agent-backup.sh` — mirror + JSONL session export + size gate + verified push
+- `templates/restore-agent.sh` — dry-run-by-default disaster recovery
+- `references/backup-failure-modes.md` — real incidents with real numbers; read this first when diagnosing
+- `scripts/verify-backup-restore.py` — hash-based fidelity checker for restore drills
+
+For the *product/curriculum* side of shipping this to students (pre-ship checklist,
+cold-drill discipline, how to report confidence boundaries to the creator), see the
+`living-course-production` skill and its
+`references/student-facing-recovery-artifacts.md`.
+- `scripts/verify-backup-restore.py` — content-hash fidelity check after a restore
+  drill. Run this instead of hand-writing a comparison:
+  `verify-backup-restore.py --source /data/.hermes --restored /tmp/fresh --fts`
+- `references/backup-failure-modes.md` — real incidents with real numbers: the
+  2.3 GB / 446-unpushed-commit silent-stale failure, the excluded-conversations
+  near-miss, SQLite affinity corruption, and how each gate was proven to fire.
+  Read this first when diagnosing a broken backup.
